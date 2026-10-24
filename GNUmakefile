@@ -1,73 +1,115 @@
-# promptOS - build with `make`, boot in QEMU with `make run`
-#
-# Host needs: gcc (x86_64), ld, make, git, xorriso, qemu-system-x86_64.
-# On a non-x86_64 host, use a cross toolchain:
-#   make CC=x86_64-elf-gcc LD=x86_64-elf-ld
+# promptOS - Custom UEFI Bootloader & Kernel
 
-LIMINE_BRANCH ?= v9.x-binary
-QEMU          ?= qemu-system-x86_64
+QEMU = qemu-system-x86_64
 
-CFLAGS  := -g -O2 -pipe -Wall -Wextra -std=gnu11 -ffreestanding \
-           -fno-stack-protector -fno-stack-check -fno-lto -fno-PIC \
-           -m64 -march=x86-64 -mno-80387 -mno-mmx -mno-sse -mno-sse2 \
-           -mno-red-zone -mcmodel=kernel -fno-tree-loop-distribute-patterns -MMD -MP
-LDFLAGS := -m elf_x86_64 -nostdlib -static -z max-page-size=0x1000 \
-           -T kernel/linker.ld
+# Arch Linux standard paths for OVMF firmware code & vars
+OVMF_CODE ?= /usr/share/edk2/x64/OVMF_CODE.4m.fd
+OVMF_VARS ?= /usr/share/edk2/x64/OVMF_VARS.4m.fd
 
-SRC := $(shell find kernel -name '*.c')
-OBJ := $(SRC:kernel/%.c=build/%.o)
+# ==========================================
+# 1. KERNEL BUILD SETTINGS
+# ==========================================
+CFLAGS = -g -O2 -pipe -Wall -Wextra -std=gnu11 -ffreestanding \
+         -fno-stack-protector -fno-stack-check -fno-lto -fno-PIC \
+         -m64 -march=x86-64 -mno-80387 -mno-mmx -mno-sse -mno-sse2 \
+         -mno-red-zone -mcmodel=kernel -fno-tree-loop-distribute-patterns -MMD -MP
 
-.PHONY: all iso run run-uefi debug clean distclean
+LDFLAGS = -m elf_x86_64 -nostdlib -static -z max-page-size=0x1000 \
+          -T kernel/linker.ld
 
-all: build/kernel
+# Find all C files EXCEPT efi_main.c (which belongs to the bootloader)
+KSRC = $(filter-out kernel/efi_main.c, $(shell find kernel -name '*.c'))
+KOBJ = $(KSRC:kernel/%.c=build/%.o)
 
-build/kernel: $(OBJ) kernel/linker.ld
-	$(LD) $(OBJ) $(LDFLAGS) -o $@
+# ==========================================
+# 2. UEFI BOOTLOADER SETTINGS (gnu-efi)
+# ==========================================
+EFI_INC = /usr/include/efi
+EFI_LIB = /usr/lib
+
+EFI_CFLAGS = -fpic -ffreestanding -fno-stack-protector -fno-stack-check \
+             -fshort-wchar -mno-red-zone -maccumulate-outgoing-args \
+             -I$(EFI_INC) -I$(EFI_INC)/x86_64 -I$(EFI_INC)/protocol
+
+EFI_LDFLAGS = -shared -Bsymbolic -L$(EFI_LIB) -T $(EFI_LIB)/elf_x86_64_efi.lds -entry _start
+EFI_LIBS = -lefi -lgnuefi
+EFI_CRT = $(EFI_LIB)/crt0-efi-x86_64.o
+
+.PHONY: all run clean
+
+all: build/kernel.elf build/BOOTX64.EFI
+
+# ==========================================
+# 3. KERNEL COMPILATION
+# ==========================================
+build/kernel.elf: $(KOBJ) kernel/linker.ld
+	$(LD) $(KOBJ) $(LDFLAGS) -o $@
 
 build/%.o: kernel/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
--include $(OBJ:.o=.d)
+-include $(KOBJ:.o=.d)
 
-# Fetch the prebuilt Limine bootloader (a clone of its -binary branch).
-limine:
-	git clone https://github.com/limine-bootloader/limine.git --branch=$(LIMINE_BRANCH) --depth=1
-	$(MAKE) -C limine
+# ==========================================
+# 4. UEFI BOOTLOADER COMPILATION
+# ==========================================
+build/efi_main.o: kernel/efi_main.c
+	@mkdir -p $(dir $@)
+	$(CC) $(EFI_CFLAGS) -c $< -o $@
 
-iso: build/promptos.iso
+# Link as an ELF shared object first using the gnu-efi linker script
+build/bootloader.so: build/efi_main.o
+	$(LD) $(EFI_LDFLAGS) $(EFI_CRT) $< -o $@ $(EFI_LIBS)
 
-build/promptos.iso: build/kernel limine.conf | limine
-	rm -rf build/iso_root
-	mkdir -p build/iso_root/boot/limine build/iso_root/EFI/BOOT
-	cp build/kernel build/iso_root/boot/kernel
-	cp limine.conf limine/limine-bios.sys limine/limine-bios-cd.bin \
-	   limine/limine-uefi-cd.bin build/iso_root/boot/limine/
-	cp limine/BOOTX64.EFI build/iso_root/EFI/BOOT/
-	xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \
-	   -no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus \
-	   -apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin \
-	   -efi-boot-part --efi-boot-image --protective-msdos-label \
-	   build/iso_root -o $@
-	./limine/limine bios-install $@
+# Convert the ELF shared object into a valid PE32+ UEFI executable (.rodata added!)
+build/BOOTX64.EFI: build/bootloader.so
+	objcopy -j .text -j .sdata -j .data -j .rodata -j .dynamic -j .dynsym -j .rel \
+            -j .rela -j .rel.* -j .rela.* -j .reloc \
+            -O efi-app-x86_64 $< $@
 
-# Boots in a QEMU window (BIOS). The shutdown command closes it.
-run: build/promptos.iso
-	$(QEMU) -M q35 -m 256M -cdrom $<
-
-# Same, but through UEFI firmware (what most real PCs and laptops use).
-# Needs OVMF; override the path if yours differs, e.g. on Fedora:
-#   make run-uefi OVMF=/usr/share/edk2/ovmf/OVMF_CODE.fd
-OVMF ?= /usr/share/ovmf/OVMF.fd
-run-uefi: build/promptos.iso
-	$(QEMU) -M q35 -m 256M -cdrom $< -bios $(OVMF)
-
-# Wait for gdb on :1234 (then: gdb build/kernel -ex 'target remote :1234')
-debug: build/promptos.iso
-	$(QEMU) -M q35 -m 256M -cdrom $< -no-reboot -s -S
+# ==========================================
+# 5. RUNNING IN QEMU
+# ==========================================
+run: all
+	@echo "Setting up virtual FAT drive..."
+	@rm -rf build/fat_root
+	@mkdir -p build/fat_root/EFI/BOOT
+	@cp build/BOOTX64.EFI build/fat_root/EFI/BOOT/
+	@cp build/kernel.elf build/fat_root/
+	@cp $(OVMF_VARS) build/OVMF_VARS.fd
+	$(QEMU) -M q35 -m 256M \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	    -drive if=pflash,format=raw,file=build/OVMF_VARS.fd \
+	    -drive file=fat:rw:build/fat_root,format=raw,media=disk
 
 clean:
 	rm -rf build
 
-distclean: clean
-	rm -rf limine
+# ==========================================
+# 6. UEFI DISK IMAGE GENERATION (.img)
+# ==========================================
+img: all
+	@echo "A criar a imagem de disco UEFI (.img)..."
+	@rm -f build/promptos.img
+	# 1. Criar uma imagem vazia de 64MB
+	@dd if=/dev/zero of=build/promptos.img bs=1M count=64 status=none
+	
+	# 2. Configurar tabela de partições GPT e partição FAT32 (ESP)
+	@parted -s build/promptos.img mklabel gpt
+	@parted -s build/promptos.img mkpart ESP fat32 1MiB 100%
+	@parted -s build/promptos.img set 1 esp on
+	
+	# 3. Associar a um loop device, formatar e copiar os ficheiros de boot
+	@LOOP_DEV=$$(sudo losetup --find --show --partscan build/promptos.img); \
+	sudo mkfs.fat -F32 $${LOOP_DEV}p1; \
+	sudo mkdir -p build/img_mount; \
+	sudo mount $${LOOP_DEV}p1 build/img_mount; \
+	sudo mkdir -p build/img_mount/EFI/BOOT; \
+	sudo cp build/BOOTX64.EFI build/img_mount/EFI/BOOT/BOOTX64.EFI; \
+	sudo cp build/kernel.elf build/img_mount/; \
+	sync; \
+	sudo umount build/img_mount; \
+	sudo losetup -d $${LOOP_DEV}; \
+	rm -rf build/img_mount
+	@echo "Imagem de disco criada com sucesso em build/promptos.img!"
