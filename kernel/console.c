@@ -4,6 +4,7 @@
 #include "color.h"
 #include "console.h"
 #include "font.h"
+#include "boot_info.h"
 
 #define MAX_COLS 256
 #define MAX_ROWS 128
@@ -12,19 +13,19 @@ static uint8_t *fb_base;
 static uint64_t fb_pitch;
 static uint32_t fb_width, fb_height;
 
-static uint32_t scale;
+static uint32_t scale = 1;
 static uint32_t cols, rows;
 static uint32_t margin_x, margin_y;
 static uint32_t cur_col, cur_row;
 static uint32_t fg_pixel, bg_pixel;
-static struct limine_framebuffer fbinfo;
+static struct promptos_framebuffer fbinfo;
 static bool ready;
 static bool bold_enabled = false;
-static int current_font = 0;             /* 0 = default, 1 = alt */
+static bool cursor_visible = true;
 
 static char cells[MAX_ROWS][MAX_COLS];
 
-static uint32_t pack(const struct limine_framebuffer *fb, uint8_t r, uint8_t g, uint8_t b) {
+static uint32_t pack(const struct promptos_framebuffer *fb, uint8_t r, uint8_t g, uint8_t b) {
     return ((uint32_t)(r >> (8 - fb->red_mask_size)) << fb->red_mask_shift) |
            ((uint32_t)(g >> (8 - fb->green_mask_size)) << fb->green_mask_shift) |
            ((uint32_t)(b >> (8 - fb->blue_mask_size)) << fb->blue_mask_shift);
@@ -39,10 +40,26 @@ static void fill_screen(uint32_t pixel) {
     }
 }
 
+static void update_metrics(void) {
+    uint32_t pad = FONT_WIDTH * scale;
+    uint32_t cell_w = FONT_WIDTH * scale;
+    uint32_t cell_h = FONT_HEIGHT * scale;
+    cols = (fb_width > 2 * pad) ? (fb_width - 2 * pad) / cell_w : 0;
+    rows = (fb_height > 2 * pad) ? (fb_height - 2 * pad) / cell_h : 0;
+    if (cols > MAX_COLS) cols = MAX_COLS;
+    if (rows > MAX_ROWS) rows = MAX_ROWS;
+    if (cols == 0) cols = 1;
+    if (rows == 0) rows = 1;
+    margin_x = (fb_width - cols * cell_w) / 2;
+    margin_y = (fb_height - rows * cell_h) / 2;
+    if (cur_col >= cols) cur_col = cols - 1;
+    if (cur_row >= rows) cur_row = rows - 1;
+}
+
 static void draw_cell(uint32_t col, uint32_t row, bool inverted) {
     char ch = cells[row][col];
     size_t idx = (ch >= 32 && ch <= 126) ? ch - 32 : 0;
-    const uint8_t *glyph = (current_font == 1) ? font8x16_alt[idx] : font8x16[idx];
+    const uint8_t *glyph = font8x16[idx];
 
     uint32_t fg = inverted ? bg_pixel : fg_pixel;
     uint32_t bg = inverted ? fg_pixel : bg_pixel;
@@ -67,6 +84,7 @@ static void draw_cell(uint32_t col, uint32_t row, bool inverted) {
 }
 
 static void redraw_all(void) {
+    fill_screen(bg_pixel);
     for (uint32_t r = 0; r < rows; r++) {
         for (uint32_t c = 0; c < cols; c++) {
             draw_cell(c, r, false);
@@ -91,9 +109,9 @@ static void newline(void) {
     redraw_all();
 }
 
-bool console_init(const struct limine_framebuffer *fb) {
+bool console_init(const struct promptos_framebuffer *fb) {
     if (fb == 0 || fb->address == 0 || fb->bpp != 32 ||
-        fb->memory_model != LIMINE_FRAMEBUFFER_RGB) {
+        fb->memory_model != PROMPTOS_FRAMEBUFFER_RGB) {
         return false;
     }
 
@@ -103,25 +121,8 @@ bool console_init(const struct limine_framebuffer *fb) {
     fb_width = (uint32_t)fb->width;
     fb_height = (uint32_t)fb->height;
 
-    scale = fb_height / 480;
-    if (scale < 1) scale = 1;
-    if (scale > 4) scale = 4;
-    while (scale > 1 && fb_width < 80 * FONT_WIDTH * scale) {
-        scale--;
-    }
-
-    uint32_t pad = FONT_WIDTH * scale;
-    uint32_t cell_w = FONT_WIDTH * scale;
-    uint32_t cell_h = FONT_HEIGHT * scale;
-    cols = (fb_width > 2 * pad) ? (fb_width - 2 * pad) / cell_w : 0;
-    rows = (fb_height > 2 * pad) ? (fb_height - 2 * pad) / cell_h : 0;
-    if (cols > MAX_COLS) cols = MAX_COLS;
-    if (rows > MAX_ROWS) rows = MAX_ROWS;
-    if (cols == 0 || rows == 0) {
-        return false;
-    }
-    margin_x = (fb_width - cols * cell_w) / 2;
-    margin_y = (fb_height - rows * cell_h) / 2;
+    scale = 1;
+    update_metrics();
 
     fg_pixel = pack(fb, (COLOR_DEFAULT_RGB >> 16) & 0xFF, (COLOR_DEFAULT_RGB >> 8) & 0xFF,
                     COLOR_DEFAULT_RGB & 0xFF);
@@ -142,6 +143,7 @@ void console_clear(void) {
     cur_col = 0;
     cur_row = 0;
     fill_screen(bg_pixel);
+    cursor_visible = true;
     draw_cell(cur_col, cur_row, true);
 }
 
@@ -149,26 +151,48 @@ void console_set_color(uint8_t r, uint8_t g, uint8_t b) {
     if (!ready) return;
     fg_pixel = pack(&fbinfo, r, g, b);
     redraw_all();
-    draw_cell(cur_col, cur_row, true);
+    draw_cell(cur_col, cur_row, cursor_visible);
 }
 
 void console_set_bold(bool bold) {
     if (!ready || bold_enabled == bold) return;
     bold_enabled = bold;
     redraw_all();
-    draw_cell(cur_col, cur_row, true);
+    draw_cell(cur_col, cur_row, cursor_visible);
 }
 
-void console_set_font(int font_id) {
-    if (!ready || current_font == font_id) return;
-    current_font = font_id;
+bool console_get_bold(void) {
+    return bold_enabled;
+}
+
+void console_set_scale(uint32_t new_scale) {
+    if (!ready || new_scale < 1 || new_scale > 4 || scale == new_scale) return;
+    scale = new_scale;
+    update_metrics();
     redraw_all();
-    draw_cell(cur_col, cur_row, true);
+    draw_cell(cur_col, cur_row, cursor_visible);
+}
+
+uint32_t console_get_scale(void) {
+    return scale;
+}
+
+void console_show_cursor(bool show) {
+    if (!ready) return;
+    cursor_visible = show;
+    draw_cell(cur_col, cur_row, cursor_visible);
+}
+
+void console_toggle_cursor(void) {
+    if (!ready) return;
+    cursor_visible = !cursor_visible;
+    draw_cell(cur_col, cur_row, cursor_visible);
 }
 
 void console_putc(char c) {
     if (!ready) return;
 
+    // Remove inverted cursor block from old position
     draw_cell(cur_col, cur_row, false);
 
     if (c == '\n') {
@@ -182,6 +206,8 @@ void console_putc(char c) {
             cur_row--;
             cur_col = cols - 1;
         }
+        cells[cur_row][cur_col] = 0;
+        draw_cell(cur_col, cur_row, false);
     } else if (c >= 32 && c <= 126) {
         cells[cur_row][cur_col] = c;
         draw_cell(cur_col, cur_row, false);
@@ -190,6 +216,8 @@ void console_putc(char c) {
         }
     }
 
+    // Always restore solid inverted cursor at the new position
+    cursor_visible = true;
     draw_cell(cur_col, cur_row, true);
 }
 
