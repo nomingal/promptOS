@@ -24,7 +24,6 @@ void kbd_init(void) {
 }
 
 char kbd_getc(void) {
-    /* 1. Try UEFI input protocol first (native driver for Aorus 17 XE4 and modern laptops) */
     if (uefi_getc_ptr) {
         char c = uefi_getc_ptr();
         if (c != 0) {
@@ -32,14 +31,31 @@ char kbd_getc(void) {
         }
     }
 
-    /* 2. Legacy PS/2 hardware fallback */
     uint8_t status = inb(0x64);
     if (status == 0xFF || !(status & 1)) {
         return 0;
     }
 
     uint8_t scancode = inb(0x60);
+    
+    /* Handle PS/2 Extended Scancodes (0xE0) for arrow keys */
+    static bool extended = false;
+    if (scancode == 0xE0) {
+        extended = true;
+        return 0;
+    }
+    bool is_ext = extended;
+    extended = false;
+
     if (scancode & 0x80) {
+        return 0;
+    }
+
+    if (is_ext) {
+        if (scancode == 0x48) return '\x11'; /* Up Arrow */
+        if (scancode == 0x50) return '\x12'; /* Down Arrow */
+        if (scancode == 0x4D) return '\x13'; /* Right Arrow */
+        if (scancode == 0x4B) return '\x14'; /* Left Arrow */
         return 0;
     }
 

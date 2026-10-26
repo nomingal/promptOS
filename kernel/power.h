@@ -1,11 +1,11 @@
+/* kernel/power.h */
 #ifndef PROMPTOS_POWER_H
 #define PROMPTOS_POWER_H
 
-/* Restart the machine. Does not return. */
-void power_reboot(void) __attribute__((noreturn));
+struct boot_info;
 
-/* Power the machine off. Does not return. On hardware where power-off is
-   not supported yet, prints a message and halts instead. */
-void power_shutdown(void) __attribute__((noreturn));
+void power_init_with_info(struct boot_info *info);
+void power_reboot(void);
+void power_shutdown(void);
 
 #endif

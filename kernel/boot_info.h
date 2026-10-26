@@ -24,6 +24,8 @@ struct promptos_framebuffer {
 struct boot_info {
     struct promptos_framebuffer *framebuffer;
     char (*getc_fn)(void);
+    void (*shutdown_fn)(void);
+    void (*reboot_fn)(void);
 };
 
 #endif

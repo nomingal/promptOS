@@ -43,11 +43,28 @@ static char uefi_getc(void) {
     if (status == EFI_SUCCESS) {
         if (key.UnicodeChar == L'\r') return '\n';
         if (key.UnicodeChar == L'\b') return '\b';
+        if (key.UnicodeChar == L'\t') return '\t';
         if (key.UnicodeChar >= 32 && key.UnicodeChar < 127) {
             return (char)key.UnicodeChar;
         }
+        if (key.ScanCode == 0x01) return '\x11'; /* Up Arrow */
+        if (key.ScanCode == 0x02) return '\x12'; /* Down Arrow */
+        if (key.ScanCode == 0x03) return '\x13'; /* Right Arrow */
+        if (key.ScanCode == 0x04) return '\x14'; /* Left Arrow */
     }
     return 0;
+}
+
+static void uefi_shutdown(void) {
+    if (gST_Global && gST_Global->RuntimeServices) {
+        uefi_call_wrapper(gST_Global->RuntimeServices->ResetSystem, 4, EfiResetShutdown, EFI_SUCCESS, 0, NULL);
+    }
+}
+
+static void uefi_reboot(void) {
+    if (gST_Global && gST_Global->RuntimeServices) {
+        uefi_call_wrapper(gST_Global->RuntimeServices->ResetSystem, 4, EfiResetCold, EFI_SUCCESS, 0, NULL);
+    }
 }
 
 static void freeze_on_error(const CHAR16 *msg) {
@@ -103,6 +120,9 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     InitializeLib(ImageHandle, SystemTable);
     gST_Global = SystemTable;
 
+    /* --- DISABLE UEFI 5-MINUTE WATCHDOG TIMER --- */
+    uefi_call_wrapper(BS->SetWatchdogTimer, 4, 0, 0, 0, NULL);
+
     uefi_call_wrapper(SystemTable->ConOut->ClearScreen, 1, SystemTable->ConOut);
     Print(L"=== promptOS Bootloader ===\n\n");
 
@@ -128,6 +148,8 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     static struct boot_info b_info;
     b_info.framebuffer = &fb;
     b_info.getc_fn = uefi_getc;
+    b_info.shutdown_fn = uefi_shutdown;
+    b_info.reboot_fn = uefi_reboot;
 
     Print(L"[OK] Framebuffer initialized (%dx%d).\n", fb.width, fb.height);
 
@@ -164,7 +186,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     uefi_call_wrapper(kernel_file->SetPosition, 2, kernel_file, ehdr.e_phoff);
     uefi_call_wrapper(kernel_file->Read, 3, kernel_file, &phdrs_size, phdrs);
 
-    /* 4. Copy UEFI Page Tables */
+    /* 4. Copy Page Tables */
     EFI_PHYSICAL_ADDRESS pml4_phys;
     status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiRuntimeServicesData, 1, &pml4_phys);
     if (EFI_ERROR(status)) {
